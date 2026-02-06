@@ -1,0 +1,10 @@
+{
+    "name": "st-indextts2",
+    "display_name": "IndexTTS2 Player",
+    "description": "IndexTTS2 播放器，支持引号检测与行内播放。",
+    "author": "kirara",
+    "version": "1.0.0",
+    "loading_order": 101,
+    "js": "index.js",
+    "css": "style.css"
+}
