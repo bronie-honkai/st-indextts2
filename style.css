@@ -205,6 +205,7 @@
     writing-mode: bt-lr;
     /* IE/Edge */
     -webkit-appearance: slider-vertical;
+    appearance: slider-vertical;
     /* WebKit */
     width: 8px;
     height: 100px;
@@ -588,23 +589,49 @@
 }
 
 /* ============================================================
-   Audio Pool Management (音频缓存池管理 - 横版按钮)
+   Audio Pool Management (音频缓存池管理 - 横版布局优化)
    ============================================================ */
 .indextts-audio-pool {
     margin-top: 12px;
 }
 
-.indextts-audio-pool-actions {
-    display: flex;
-    flex-direction: row;
-    flex-wrap: nowrap;
-    gap: 8px;
-    align-items: center;
-    margin-top: 8px;
+/* 路径容器: [路径名] [选择] [授权] */
+.indextts-path-container {
+    display: flex !important;
+    flex-direction: row !important;
+    flex-wrap: nowrap !important;
+    gap: 10px !important;
+    align-items: center !important;
+    margin-bottom: 8px !important;
 }
 
-.indextts-audio-pool-actions .menu_button {
+.indextts-path-display {
+    flex: 1;
+    overflow: hidden;
+    text-overflow: ellipsis;
     white-space: nowrap;
+    background: var(--black30a, rgba(0, 0, 0, 0.3));
+    padding: 6px 10px;
+    border-radius: 5px;
+    border: 1px solid var(--SmartThemeBorderColor, rgba(255, 255, 255, 0.2));
+    color: var(--SmartThemeEmColor, #aaa);
+    font-size: 0.85em;
+    cursor: default;
+}
+
+/* 按钮组: [扫描] [导出] [清空] */
+.indextts-audio-pool-actions {
+    display: flex !important;
+    flex-direction: row !important;
+    flex-wrap: nowrap !important;
+    gap: 10px !important;
+    align-items: center !important;
+    margin-top: 8px !important;
+}
+
+.indextts-audio-pool-actions .menu_button,
+.indextts-path-container .menu_button {
+    white-space: nowrap !important;
     flex-shrink: 0;
     padding: 6px 12px;
     font-size: 0.9em;
@@ -616,9 +643,31 @@
     transition: filter 0.15s ease, background-color 0.15s ease;
 }
 
-.indextts-audio-pool-actions .menu_button:hover {
+.indextts-audio-pool-actions .menu_button:hover,
+.indextts-path-container .menu_button:hover {
     filter: brightness(1.15);
     background-color: var(--white20a, rgba(255, 255, 255, 0.1));
+}
+
+/* 授权按钮呼吸灯特效 */
+.indextts-auth-btn {
+    border-color: var(--SmartThemeQuoteColor, #e18a24) !important;
+    color: var(--SmartThemeQuoteColor, #e18a24) !important;
+    animation: auth-pulse 2s infinite;
+}
+
+@keyframes auth-pulse {
+    0% {
+        box-shadow: 0 0 0 0 rgba(225, 138, 36, 0.4);
+    }
+
+    70% {
+        box-shadow: 0 0 0 6px rgba(225, 138, 36, 0);
+    }
+
+    100% {
+        box-shadow: 0 0 0 0 rgba(225, 138, 36, 0);
+    }
 }
 
 /* ============================================================
@@ -711,4 +760,56 @@
    ============================================================ */
 .wide100p {
     width: 100% !important;
+}
+
+/* ============================================================
+   Preset Management Bar (预设管理栏)
+   ============================================================ */
+.indextts-preset-bar,
+.indextts-preset-bar-popup {
+    display: flex;
+    gap: 6px;
+    align-items: center;
+}
+
+.indextts-preset-bar select,
+.indextts-preset-bar-popup select {
+    flex: 1;
+    min-width: 0;
+}
+
+.indextts-preset-bar input[type="text"],
+.indextts-preset-bar-popup input[type="text"] {
+    flex: 1;
+    min-width: 0;
+}
+
+.indextts-preset-bar .menu_button,
+.indextts-preset-bar-popup .menu_button {
+    flex-shrink: 0;
+    width: 36px;
+    height: 36px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 0;
+    background: var(--SmartThemeBlurTintColor, #171717);
+    border: 1px solid var(--SmartThemeBorderColor, rgba(255, 255, 255, 0.2));
+    border-radius: 5px;
+    color: var(--SmartThemeBodyColor, #dcdcd2);
+    cursor: pointer;
+    transition: filter 0.15s ease, background-color 0.15s ease;
+}
+
+.indextts-preset-bar .menu_button:hover,
+.indextts-preset-bar-popup .menu_button:hover {
+    filter: brightness(1.2);
+    background-color: var(--white20a, rgba(255, 255, 255, 0.1));
+}
+
+/* Popup variant padding */
+.indextts-preset-bar-popup {
+    padding: 8px 16px;
+    background: var(--black30a, rgba(0, 0, 0, 0.3));
+    border-bottom: 1px solid var(--SmartThemeBorderColor, rgba(0, 0, 0, 0.5));
 }

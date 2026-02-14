@@ -1,9 +1,5 @@
 # st-indextts2 更新报告
 
-来源：
-- 旧版：st-indextts2-old/index.js
-- 新版：st-indextts2/index.js
-
 更新时间：2026-02-14
 
 概述：
@@ -54,10 +50,3 @@
 提交信息建议：
 - Commit: "chore: add update report and document major refactor (settings, local FS, prompt injection)"
 
-如需我现在将报告提交并尝试推送到远程仓库，请确认：
-- 你已提供远程仓库 URL（已收到：https://github.com/bronie-honkai/st-indextts2）
-- 我将使用分支 `main`（你之前选择）进行推送
-- 本机需已配置 Git 认证（HTTPS/SSH），否则推送会失败
-
----
-报告由本地差异比对生成。如需更详细的逐行 diff（patch）、或把 `UPDATE_REPORT.md` 放到不同路径/自定义 commit message，请告诉我。

@@ -16,46 +16,156 @@
         cacheImportPath: '\\\\SillyTavern\\\\data\\\\TTSsound',
         // VN format: [角色|表情]|「对话」 or [旁白]|描述
         vnRegex: '^\\[([^\\]|]+)(?:\\|[^\\]]*)?\\]\\|(.+)$',
-        voiceMap: {} // { cardId: { characterName: "voice.wav" } }
+        voiceMap: {}, // { cardId: { characterName: "voice.wav" } }
+        promptInjection: {
+            enabled: false,
+            content: `描写任何角色（主要角色、NPC、路人）说话时，必须严格遵守格式，对话单开一行：
+       格式：[角色名|表情]|「对话内容」
+     - **严禁**只写名字（如 [萧凡]），**严禁**漏掉表情。
+     - **强制规则**：若无特定表情，必须使用 [角色名|通常]「对话内容」。`,
+            position: "depth",
+            depth: 4,
+            role: "system"
+        }
     };
 
     // ==================== Settings Management ====================
     function getSettings() {
-        // Always read from the global extension_settings
+        // ========== 第一步：从 Context（唯一真理来源）读取 ==========
+        const ctx = window.SillyTavern?.getContext?.();
+        const contextStore = ctx?.extensionSettings;
         if (!window.extension_settings) window.extension_settings = {};
-        if (!window.extension_settings[extensionName]) {
-            window.extension_settings[extensionName] = JSON.parse(JSON.stringify(defaultSettings));
+
+        // 优先级：Context > window.extension_settings > 全新初始化
+        let root = null;
+        if (contextStore && contextStore[extensionName] && typeof contextStore[extensionName] === 'object') {
+            // 【最高优先级】从 Context 读取（服务器持久化数据在这里）
+            root = contextStore[extensionName];
+            console.debug('[IndexTTS2] Settings loaded from Context');
+        } else if (window.extension_settings[extensionName] && typeof window.extension_settings[extensionName] === 'object') {
+            // 【兼容旧版本】从 window 读取
+            root = window.extension_settings[extensionName];
+            console.debug('[IndexTTS2] Settings loaded from window (legacy fallback)');
         }
-        const settings = window.extension_settings[extensionName];
-        // Ensure voiceMap exists
-        if (!settings.voiceMap) {
-            settings.voiceMap = {};
+
+        // ========== 第二步：迁移旧格式 / 全新初始化 ==========
+        if (!root || !root.presets) {
+            const oldData = root && root.apiUrl ? root : null;
+            const migratedPreset = oldData
+                ? Object.assign(JSON.parse(JSON.stringify(defaultSettings)), oldData)
+                : JSON.parse(JSON.stringify(defaultSettings));
+            delete migratedPreset.selected_preset;
+            delete migratedPreset.presets;
+            root = { selected_preset: 'Default', presets: { 'Default': migratedPreset } };
+            console.log('[IndexTTS2] Migrated/initialized preset architecture');
         }
-        // Ensure volume exists for legacy configs
-        if (settings.volume === undefined || settings.volume === null || isNaN(settings.volume)) {
-            settings.volume = 1.0;
+
+        // ========== 第三步：双向同步引用（共享同一个对象引用） ==========
+        // 写入 Context（真正的持久化位置，最重要）
+        if (contextStore) {
+            contextStore[extensionName] = root;
         }
-        if (settings.parsingMode === undefined) {
-            settings.parsingMode = 'gal';
+        // 挂载到 window.extension_settings（便利镜像，供其他代码直接访问）
+        window.extension_settings[extensionName] = root;
+
+        // ========== 第四步：校验 & 补齐当前预设 ==========
+        if (!root.presets[root.selected_preset]) {
+            root.selected_preset = Object.keys(root.presets)[0] || 'Default';
+            if (!root.presets[root.selected_preset]) {
+                root.presets['Default'] = JSON.parse(JSON.stringify(defaultSettings));
+                root.selected_preset = 'Default';
+            }
         }
-        if (settings.enableInline === undefined) {
-            settings.enableInline = true;
+
+        const active = root.presets[root.selected_preset];
+        for (const [key, val] of Object.entries(defaultSettings)) {
+            if (!Object.prototype.hasOwnProperty.call(active, key)) {
+                active[key] = val;
+            }
         }
-        if (settings.autoInference === undefined) {
-            settings.autoInference = false;
+        if (typeof active.voiceMap !== 'object') active.voiceMap = {};
+
+        // Deep merge for promptInjection to ensure all sub-fields exist
+        if (!active.promptInjection || typeof active.promptInjection !== 'object') {
+            active.promptInjection = JSON.parse(JSON.stringify(defaultSettings.promptInjection));
+        } else {
+            // Fill in missing sub-fields from defaultSettings
+            for (const [key, val] of Object.entries(defaultSettings.promptInjection)) {
+                if (!Object.prototype.hasOwnProperty.call(active.promptInjection, key)) {
+                    active.promptInjection[key] = typeof val === 'object' && val !== null
+                        ? JSON.parse(JSON.stringify(val))
+                        : val;
+                }
+            }
         }
-        if (settings.cacheImportPath === undefined || settings.cacheImportPath === null) {
-            settings.cacheImportPath = defaultSettings.cacheImportPath;
+
+        return active;
+    }
+
+    /** 返回顶层根对象 { selected_preset, presets }，供 UI 层使用 */
+    function getRootSettings() {
+        getSettings(); // 确保初始化/迁移/同步完成
+        // 强制从 Context 返回（唯一真理来源）
+        const ctx = window.SillyTavern?.getContext?.();
+        if (ctx?.extensionSettings?.[extensionName]) {
+            return ctx.extensionSettings[extensionName];
         }
-        return settings;
+        // 极端降级：Context 不可用时用 window
+        return window.extension_settings[extensionName];
     }
 
     function saveSettings() {
-        // The settings object is a reference to extension_settings[extensionName]
-        // Just trigger the save
+        // 第一步：从 Context（唯一真理来源）获取 root
+        const ctx = window.SillyTavern?.getContext?.();
+        let root = ctx?.extensionSettings?.[extensionName];
+        // 降级：如果 Context 里没有，尝试 window
+        if (!root) root = window.extension_settings?.[extensionName];
+        if (!root) {
+            console.warn('[IndexTTS2] saveSettings: no root data found, skipping');
+            return;
+        }
+
+        // 第二步：通过 _.set 写入 Context（官方持久化路径）
+        try {
+            if (ctx?.extensionSettings && typeof _ !== 'undefined' && _.set) {
+                _.set(ctx.extensionSettings, extensionName, root);
+            }
+        } catch (e) {
+            console.warn('[IndexTTS2] _.set fallback:', e);
+        }
+
+        // 第三步：同步到 window（保持引用一致性）
+        if (!window.extension_settings) window.extension_settings = {};
+        window.extension_settings[extensionName] = root;
+
+        // 第四步：触发异步落盘
         if (typeof window.saveSettingsDebounced === 'function') {
             window.saveSettingsDebounced();
-            console.log('[IndexTTS2] Settings saved');
+        }
+    }
+
+    /**
+     * 切换预设 —— 核心：移除并重绘 UI，保证 100% 同步
+     * @param {string} name 目标预设名
+     */
+    function switchPreset(name) {
+        const root = getRootSettings();
+        if (!root.presets[name]) return;
+        root.selected_preset = name;
+        saveSettings();
+
+        // 移除并重绘设置面板
+        const settingsEl = document.getElementById('indextts-settings');
+        if (settingsEl) {
+            settingsEl.remove();
+            injectSettingsPanel();
+        }
+
+        // 如果配音弹窗正在打开，也重绘
+        const modalEl = document.getElementById('indextts-modal');
+        if (modalEl) {
+            modalEl.remove();
+            showConfigPopup();
         }
     }
 
@@ -199,7 +309,7 @@
                     resolve(null);
                     return;
                 }
-                const request = window.indexedDB.open('IndexTTS_Store', 1);
+                const request = window.indexedDB.open('IndexTTS_Store', 2);
                 request.onerror = () => {
                     console.error('[IndexTTS2] indexedDB open error:', request.error);
                     resolve(null);
@@ -209,6 +319,9 @@
                     if (!db.objectStoreNames.contains('audios')) {
                         const store = db.createObjectStore('audios', { keyPath: 'hash' });
                         store.createIndex('timestamp', 'timestamp', { unique: false });
+                    }
+                    if (!db.objectStoreNames.contains('configs')) {
+                        db.createObjectStore('configs');
                     }
                 };
                 request.onsuccess = () => {
@@ -288,12 +401,78 @@
             });
         }
 
+        async function saveConfig(key, value) {
+            const db = await getDB();
+            if (!db) return;
+            return new Promise((resolve, reject) => {
+                const tx = db.transaction('configs', 'readwrite');
+                const store = tx.objectStore('configs');
+                const req = store.put(value, key);
+                tx.oncomplete = () => resolve();
+                tx.onerror = () => reject(tx.error);
+                req.onerror = () => reject(req.error);
+            });
+        }
+
+        async function getConfig(key) {
+            const db = await getDB();
+            if (!db) return null;
+            return new Promise((resolve, reject) => {
+                const tx = db.transaction('configs', 'readonly');
+                const store = tx.objectStore('configs');
+                const req = store.get(key);
+                req.onsuccess = () => resolve(req.result);
+                req.onerror = () => reject(req.error);
+            });
+        }
+
         return {
             saveAudio,
             getAudio,
             getAllAudios,
             clearAllAudios,
+            saveConfig,
+            getConfig
         };
+    })();
+
+    // ==================== Local Repository Management ====================
+    const LocalRepo = (function () {
+        let dirHandle = null;
+
+        async function init() {
+            try {
+                const handle = await AudioStorage.getConfig('localDirHandle');
+                if (handle) {
+                    dirHandle = handle;
+                    console.log('[IndexTTS2] LocalRepo handle restored');
+                }
+            } catch (e) {
+                console.warn('[IndexTTS2] LocalRepo init error:', e);
+            }
+        }
+
+        async function setHandle(handle) {
+            if (!handle) return;
+            dirHandle = handle;
+            await AudioStorage.saveConfig('localDirHandle', handle);
+        }
+
+        function getHandle() { return dirHandle; }
+
+        async function requestPermission() {
+            if (!dirHandle) return false;
+            const opts = { mode: 'readwrite' };
+            try {
+                if ((await dirHandle.queryPermission(opts)) === 'granted') return true;
+                if ((await dirHandle.requestPermission(opts)) === 'granted') return true;
+            } catch (e) {
+                console.warn('[IndexTTS2] Permission request failed:', e);
+            }
+            return false;
+        }
+
+        return { init, setHandle, getHandle, requestPermission };
     })();
 
     async function generateHash(character, voiceId, text, speed, volume) {
@@ -474,7 +653,7 @@
     }
 
     // ==================== TTS API & Cache Flow ====================
-    async function ensureAudioRecord({ text, character, voice }) {
+    async function ensureAudioRecord({ text, character, voice, allowFetch = true }) {
         if (!text?.trim()) return null;
         const settings = getSettings();
         // Use default voice if specific voice not set, UNLESS we want to be strict (but ensureAudioRecord is usually for playback).
@@ -501,6 +680,11 @@
             }
         } catch (e) {
             console.warn('[IndexTTS2] getAudio failed, fallback to API:', e);
+        }
+
+        if (!allowFetch) {
+            console.log('[IndexTTS2] Auto-inference disabled & cache miss, skipping API request.');
+            return null;
         }
 
         console.log('[IndexTTS2] [API Request]', hash);
@@ -552,6 +736,8 @@
     async function playSingleLine(text, voiceFile, character, context) {
         if (!text?.trim()) return;
         const ctx = context || {};
+        // Explicitly check for false, default to true
+        const allowFetch = ctx.autoInfer === false ? false : true;
         let msg = ctx.msg || null;
         const encT = ctx.encT || utf8ToBase64(text);
         const encC = ctx.encC || utf8ToBase64(character || '');
@@ -590,7 +776,7 @@
 
         let record;
         try {
-            record = await ensureAudioRecord({ text, character, voice: finalVoice });
+            record = await ensureAudioRecord({ text, character, voice: finalVoice, allowFetch });
             if (!record) return;
         } catch (e) {
             if (window.toastr) window.toastr.error('TTS失败: ' + e.message);
@@ -751,6 +937,16 @@
         modal.innerHTML = `
             <div class="indextts-modal-box">
                 <div class="indextts-popup-header"><h3>🎙️ 配音配置 - ${cardName}</h3></div>
+                <div class="indextts-preset-bar-popup">
+                    <select id="indextts-popup-preset-select" class="text_pole"></select>
+                    <input type="text" id="indextts-popup-preset-name" class="text_pole" placeholder="预设名称">
+                    <div id="indextts-popup-preset-save" class="menu_button" title="保存/新建预设">
+                        <i class="fa-solid fa-floppy-disk"></i>
+                    </div>
+                    <div id="indextts-popup-preset-delete" class="menu_button" title="删除预设">
+                        <i class="fa-solid fa-trash-can"></i>
+                    </div>
+                </div>
                 <div class="indextts-add-container">
                     <input type="text" id="indextts-new-char" class="text_pole" placeholder="输入新角色名">
                     <button class="menu_button" id="indextts-add-btn"><i class="fa-solid fa-plus"></i> 添加</button>
@@ -759,10 +955,6 @@
                     <button class="menu_button" id="indextts-import"><i class="fa-solid fa-file-import"></i> 导入全部</button>
                     <button class="menu_button" id="indextts-export"><i class="fa-solid fa-file-export"></i> 导出全部</button>
                 </div>
-                <!-- <div class="indextts-manual-hint">
-                    <i class="fa-solid fa-info-circle"></i>
-                    <span>手动放置: 将.wav放入 <code>api/ckyp/</code> 目录后输入文件名</span>
-                </div> -->
                 <div class="indextts-char-list" id="indextts-char-list-container"></div>
                 <div class="indextts-popup-footer">
                     <button class="menu_button" id="indextts-cancel">取消</button>
@@ -773,6 +965,65 @@
         document.body.appendChild(modal);
 
         renderListResults();
+
+        // ==================== Popup Preset Management ====================
+        const populatePopupPresetUI = () => {
+            const root = getRootSettings();
+            const selectEl = modal.querySelector('#indextts-popup-preset-select');
+            const nameEl = modal.querySelector('#indextts-popup-preset-name');
+            if (!selectEl || !nameEl) return;
+            selectEl.innerHTML = Object.keys(root.presets).map(name =>
+                `<option value="${name}"${name === root.selected_preset ? ' selected' : ''}>${name}</option>`
+            ).join('');
+            nameEl.value = root.selected_preset;
+        };
+        populatePopupPresetUI();
+
+        // Switch preset → switchPreset 移除重绘（switchPreset 自动重开弹窗和面板）
+        const popupPresetSelect = modal.querySelector('#indextts-popup-preset-select');
+        if (popupPresetSelect) {
+            popupPresetSelect.onchange = () => {
+                switchPreset(popupPresetSelect.value);
+            };
+        }
+
+        // Save preset from popup
+        const popupPresetSave = modal.querySelector('#indextts-popup-preset-save');
+        if (popupPresetSave) {
+            popupPresetSave.onclick = () => {
+                const root = getRootSettings();
+                const nameEl = modal.querySelector('#indextts-popup-preset-name');
+                const name = (nameEl?.value || '').trim();
+                if (!name) {
+                    if (window.toastr) window.toastr.warning('请输入预设名称');
+                    return;
+                }
+                root.presets[name] = JSON.parse(JSON.stringify(getSettings()));
+                root.selected_preset = name;
+                saveSettings();
+                populatePopupPresetUI();
+                if (window.toastr) window.toastr.success(`预设 "${name}" 已保存`);
+            };
+        }
+
+        // Delete preset from popup
+        const popupPresetDel = modal.querySelector('#indextts-popup-preset-delete');
+        if (popupPresetDel) {
+            popupPresetDel.onclick = () => {
+                const root = getRootSettings();
+                const keys = Object.keys(root.presets);
+                if (keys.length <= 1) {
+                    if (window.toastr) window.toastr.warning('至少需要保留一个预设');
+                    return;
+                }
+                const current = root.selected_preset;
+                if (!confirm(`确定要删除预设 "${current}" 吗？`)) return;
+                delete root.presets[current];
+                // switchPreset 会删除弹窗并重新打开
+                switchPreset(Object.keys(root.presets)[0]);
+                if (window.toastr) window.toastr.success(`已删除预设 "${current}"`);
+            };
+        }
 
         // Handlers
         modal.onclick = e => { if (e.target === modal) modal.remove(); };
@@ -821,8 +1072,9 @@
             const json = JSON.stringify(allData, null, 2);
             const blob = new Blob([json], { type: 'application/json' });
             const a = document.createElement('a');
+            const cardName = getCardName();
             a.href = URL.createObjectURL(blob);
-            a.download = 'voice_config_all.json';
+            a.download = `${cardName}_配音配置.json`;
             a.click();
             if (window.toastr) window.toastr.success('已导出全部配置');
         };
@@ -1659,12 +1911,36 @@
 
     // ==================== Settings Panel ====================
     function injectSettingsPanel() {
-        if (document.getElementById('indextts-settings')) return;
+        if (document.getElementById('indextts-settings')) {
+            // Panel exists, check if we need to update values from external changes (e.g. init load)
+            const settings = getSettings();
+
+            // Sync values if they don't match (simple one-way binding check)
+            const urlInput = document.getElementById('indextts-url');
+            if (urlInput && urlInput.value !== settings.apiUrl) urlInput.value = settings.apiUrl;
+
+            // ... (We could do this for all fields, but usually re-injection isn't frequent if ID check prevents it)
+            // However, for the path specifically, we want to ensure it's up to date
+            const pathMsg = settings.cacheImportPath || '未设置本地目录';
+            const pathInput = document.getElementById('indextts-local-path');
+            if (pathInput && pathInput.value !== pathMsg) pathInput.value = pathMsg;
+
+            return;
+        }
+
         const container = document.getElementById('extensions_settings') || document.getElementById('extensions_settings_container');
         if (!container) return;
 
         const settings = getSettings();
         const volumeVal = typeof settings.volume === 'number' ? settings.volume : 1.0;
+
+        // Prepare Path Display
+        let pathDisplay = settings.cacheImportPath || '未设置本地目录';
+        const handle = LocalRepo.getHandle();
+        if (handle && handle.name) {
+            pathDisplay = handle.name;
+        }
+
         const html = `
             <div id="indextts-settings" class="extension_settings">
                 <div class="inline-drawer">
@@ -1674,6 +1950,21 @@
                     </div>
                     <div class="inline-drawer-content" style="display:none;">
                         
+                        <!-- 预设管理 -->
+                        <div class="indextts-setting-module">
+                            <div class="indextts-module-header">⚙ 预设管理</div>
+                            <div class="indextts-preset-bar">
+                                <select id="indextts-preset-select" class="text_pole"></select>
+                                <input type="text" id="indextts-preset-name" class="text_pole" placeholder="预设名称">
+                                <div id="indextts-preset-save" class="menu_button" title="保存/新建预设">
+                                    <i class="fa-solid fa-floppy-disk"></i>
+                                </div>
+                                <div id="indextts-preset-delete" class="menu_button" title="删除预设">
+                                    <i class="fa-solid fa-trash-can"></i>
+                                </div>
+                            </div>
+                        </div>
+
                         <!-- 模块1：服务配置 -->
                         <div class="indextts-setting-module">
                             <div class="indextts-module-header">🔌 服务配置</div>
@@ -1688,6 +1979,31 @@
                              <div class="indextts-setting-row">
                                 <label>推理模型名称</label>
                                 <input type="text" id="indextts-model" class="text_pole" value="${settings.model}">
+                            </div>
+                        </div>
+
+                        <!-- 模块：提示词管理 -->
+                        <div class="indextts-setting-module">
+                            <div class="indextts-module-header">📝 提示词管理</div>
+                             <div class="indextts-setting-row checkbox-row">
+                                <label for="indextts-prompt-enable">启用提示词注入</label>
+                                <input type="checkbox" id="indextts-prompt-enable"${settings.promptInjection?.enabled ? ' checked' : ''}>
+                            </div>
+                            <div class="indextts-setting-row">
+                                <label>注入深度 (Depth)</label>
+                                <input type="number" id="indextts-prompt-depth" class="text_pole" value="${settings.promptInjection?.depth ?? 4}" min="0">
+                            </div>
+                            <div class="indextts-setting-row">
+                                <label>角色 (Role)</label>
+                                <select id="indextts-prompt-role" class="text_pole">
+                                    <option value="system"${settings.promptInjection?.role === 'system' ? ' selected' : ''}>System</option>
+                                    <option value="user"${settings.promptInjection?.role === 'user' ? ' selected' : ''}>User</option>
+                                    <option value="assistant"${settings.promptInjection?.role === 'assistant' ? ' selected' : ''}>Assistant</option>
+                                </select>
+                            </div>
+                             <div class="indextts-setting-row" style="flex-direction:column; align-items:flex-start;">
+                                <label style="margin-bottom:5px;">提示词内容</label>
+                                <textarea id="indextts-prompt-content" class="text_pole" rows="4" placeholder="输入要注入的提示词...">${settings.promptInjection?.content || ''}</textarea>
                             </div>
                         </div>
 
@@ -1726,10 +2042,12 @@
                         <!-- 模块3：缓存管理 -->
                         <div class="indextts-setting-module">
                             <div class="indextts-module-header">💾 音频缓存管理</div>
-                             <div class="indextts-setting-row">
-                                <label>本地缓存目录</label>
-                                <input type="text" id="indextts-cache-import-path" class="text_pole" value="${(settings.cacheImportPath || '').replace(/"/g, '&quot;')}" placeholder="\\\\SillyTavern\\\\data\\\\TTSsound">
+                             <div class="indextts-path-container">
+                                <input type="text" id="indextts-local-path" class="indextts-path-display" value="${pathDisplay}" readonly title="${pathDisplay}">
+                                <button class="menu_button" id="indextts-choose-folder" title="选择本地文件夹">📂 选择</button>
+                                <button class="menu_button indextts-auth-btn" id="indextts-auth-btn" title="需授权读写权限" style="display:none;">🔄 授权</button>
                             </div>
+                            
                             <div class="indextts-audio-pool">
                                 <div>已缓存音频: <span id="indextts-cache-count">0</span> 条</div>
                                 <div class="indextts-audio-pool-actions">
@@ -1750,73 +2068,228 @@
 
         const panel = document.getElementById('indextts-settings');
 
-        // Module 1
-        panel.querySelector('#indextts-url').onchange = e => { getSettings().apiUrl = e.target.value; saveSettings(); };
-        panel.querySelector('#indextts-clone-url').onchange = e => { getSettings().cloningUrl = e.target.value; saveSettings(); };
-        panel.querySelector('#indextts-model').onchange = e => { getSettings().model = e.target.value; saveSettings(); };
+        // ==================== Event Bindings for Persistence ====================
 
-        // Module 2
-        const modeSelect = panel.querySelector('#indextts-parsing-mode');
-        if (modeSelect) {
-            modeSelect.onchange = e => {
-                getSettings().parsingMode = e.target.value;
-                saveSettings();
-                refreshAllMessages();
-            };
-        }
-
-        const inlineCheck = panel.querySelector('#indextts-enable-inline');
-        if (inlineCheck) {
-            inlineCheck.onchange = e => {
-                getSettings().enableInline = e.target.checked;
-                saveSettings();
-                refreshAllMessages();
-            };
-        }
-
-        const autoInfCheck = panel.querySelector('#indextts-auto-inference');
-        if (autoInfCheck) {
-            autoInfCheck.onchange = e => {
-                getSettings().autoInference = e.target.checked;
-                saveSettings();
-            };
-        }
-
-        panel.querySelector('#indextts-voice').onchange = e => { getSettings().defaultVoice = ensureWavSuffix(e.target.value); saveSettings(); };
-        panel.querySelector('#indextts-speed').oninput = e => {
-            getSettings().speed = parseFloat(e.target.value);
-            document.getElementById('indextts-speed-val').textContent = e.target.value;
-            saveSettings();
+        // 1. Service Config
+        const bindInput = (id, field) => {
+            const el = panel.querySelector(id);
+            if (el) {
+                el.oninput = el.onchange = (e) => {
+                    const s = getSettings();
+                    s[field] = e.target.value;
+                    saveSettings();
+                };
+            }
         };
+
+        bindInput('#indextts-url', 'apiUrl');
+        bindInput('#indextts-clone-url', 'cloningUrl');
+        bindInput('#indextts-model', 'model');
+
+        // 2. Playback & Automation
+        const bindSelect = (id, field) => {
+            const el = panel.querySelector(id);
+            if (el) {
+                el.onchange = (e) => {
+                    const s = getSettings();
+                    s[field] = e.target.value;
+                    saveSettings();
+                    refreshAllMessages();
+                };
+            }
+        };
+        bindSelect('#indextts-parsing-mode', 'parsingMode');
+
+        const bindCheckbox = (id, field, needRefresh = false) => {
+            const el = panel.querySelector(id);
+            if (el) {
+                el.onchange = (e) => {
+                    const s = getSettings();
+                    s[field] = e.target.checked;
+                    saveSettings();
+                    if (needRefresh) refreshAllMessages();
+                };
+            }
+        };
+        bindCheckbox('#indextts-enable-inline', 'enableInline', true);
+        bindCheckbox('#indextts-auto-inference', 'autoInference', false);
+
+        // Voice
+        const voiceInput = panel.querySelector('#indextts-voice');
+        if (voiceInput) {
+            voiceInput.onchange = (e) => {
+                const s = getSettings();
+                s.defaultVoice = ensureWavSuffix(e.target.value);
+                saveSettings();
+            };
+        }
+
+        // Sliders
+        const speedInput = panel.querySelector('#indextts-speed');
+        if (speedInput) {
+            speedInput.oninput = (e) => {
+                const val = parseFloat(e.target.value);
+                document.getElementById('indextts-speed-val').textContent = val;
+                const s = getSettings();
+                s.speed = val;
+                saveSettings();
+            };
+        }
+
         const volInput = panel.querySelector('#indextts-volume');
         if (volInput) {
-            volInput.oninput = e => {
-                const v = parseFloat(e.target.value);
-                getSettings().volume = v;
-                const span = document.getElementById('indextts-volume-val');
-                if (span) span.textContent = v.toFixed(2);
+            volInput.oninput = (e) => {
+                const val = parseFloat(e.target.value);
+                document.getElementById('indextts-volume-val').textContent = val.toFixed(2);
+                const s = getSettings();
+                s.volume = val;
                 saveSettings();
             };
         }
 
-        // Module 3
-        const pathInput = panel.querySelector('#indextts-cache-import-path');
-        if (pathInput) {
-            pathInput.onchange = e => { getSettings().cacheImportPath = (e.target.value || '').trim(); saveSettings(); };
+        // ==================== Module: Prompt Injection ====================
+        const bindPrompt = (id, field) => {
+            const el = panel.querySelector(id);
+            if (el) {
+                el.oninput = el.onchange = (e) => {
+                    const s = getSettings();
+                    // Initialize with full default structure if missing
+                    if (!s.promptInjection || typeof s.promptInjection !== 'object') {
+                        s.promptInjection = JSON.parse(JSON.stringify(defaultSettings.promptInjection));
+                    }
+                    // Update the specific field
+                    s.promptInjection[field] = e.target.type === 'checkbox' ? e.target.checked : e.target.value;
+                    saveSettings();
+                };
+            }
+        };
+        bindPrompt('#indextts-prompt-enable', 'enabled');
+        bindPrompt('#indextts-prompt-depth', 'depth');
+        bindPrompt('#indextts-prompt-role', 'role');
+        bindPrompt('#indextts-prompt-content', 'content');
+
+        // ==================== Module 3: Audio Cache Management ====================
+        const pathInputEl = panel.querySelector('#indextts-local-path');
+        const authBtn = panel.querySelector('#indextts-auth-btn');
+
+        // UI Update Helper
+        const updatePathUI = async () => {
+            const h = LocalRepo.getHandle();
+            const s = getSettings();
+
+            // Priority: Handle Name > Settings Path > Default
+            let displayPath = '未设置本地目录';
+            if (h && h.name) {
+                displayPath = h.name;
+            } else if (s.cacheImportPath) {
+                displayPath = s.cacheImportPath;
+            }
+
+            if (pathInputEl) pathInputEl.value = displayPath;
+            if (pathInputEl) pathInputEl.title = displayPath;
+
+            // Check permissions only if we have a handle
+            if (h) {
+                let hasPerm = false;
+                try {
+                    if ((await h.queryPermission({ mode: 'readwrite' })) === 'granted') {
+                        hasPerm = true;
+                    }
+                } catch (e) { }
+
+                if (hasPerm) {
+                    authBtn.style.display = 'none';
+                } else {
+                    authBtn.style.display = 'inline-block';
+                }
+            } else {
+                authBtn.style.display = 'none';
+            }
+        };
+
+        // 1. Choose Folder
+        const chooseBtn = panel.querySelector('#indextts-choose-folder');
+        if (chooseBtn) {
+            chooseBtn.onclick = async () => {
+                if (!window.showDirectoryPicker) {
+                    if (window.toastr) window.toastr.error('浏览器不支持 File System Access API');
+                    return;
+                }
+                try {
+                    const h = await window.showDirectoryPicker();
+                    if (h) {
+                        // 1. Save handle to IndexedDB
+                        await LocalRepo.setHandle(h);
+
+                        // 2. Sync to Settings
+                        const s = getSettings();
+                        s.cacheImportPath = h.name;
+                        saveSettings();
+
+                        // 3. Update UI
+                        await updatePathUI();
+
+                        if (window.toastr) window.toastr.success(`已选定目录: ${h.name}`);
+                    }
+                } catch (e) {
+                    if (e.name !== 'AbortError') console.error(e);
+                }
+            };
         }
 
+        // 2. Authorize Button
+        if (authBtn) {
+            authBtn.onclick = async () => {
+                const success = await LocalRepo.requestPermission();
+                if (success) {
+                    if (window.toastr) window.toastr.success('已获授权');
+                    await updatePathUI();
+                } else {
+                    if (window.toastr) window.toastr.warning('授权失败或被拒绝');
+                }
+            };
+        }
+
+        // 3. Scan & Import (Using Handle Logic)
         const scanImportBtn = panel.querySelector('#indextts-scan-import');
         if (scanImportBtn) {
             scanImportBtn.onclick = async () => {
-                await importFromLocalDirectory();
+                const h = LocalRepo.getHandle();
+                if (!h) {
+                    if (window.toastr) window.toastr.warning('请先点击【📂 选择】设置本地音频目录');
+                    return;
+                }
+                // Ensure permission
+                const hasPerm = await LocalRepo.requestPermission();
+                if (!hasPerm) {
+                    if (window.toastr) window.toastr.error('未获得读写权限，无法扫描');
+                    await updatePathUI();
+                    return;
+                }
+
+                await importFromLocalDirectory(h); // Pass handle directly
                 await updateAudioPoolStats();
             };
         }
 
+        // 4. Export (Using Handle Logic)
         const exportBtn = panel.querySelector('#indextts-export-cache');
         if (exportBtn) {
             exportBtn.onclick = async () => {
-                await exportAudioCacheToFolder();
+                const h = LocalRepo.getHandle();
+                if (!h) {
+                    if (window.toastr) window.toastr.warning('请先点击【📂 选择】设置本地音频目录');
+                    return;
+                }
+                // Ensure permission
+                const hasPerm = await LocalRepo.requestPermission();
+                if (!hasPerm) {
+                    if (window.toastr) window.toastr.error('未获得读写权限，无法导出');
+                    await updatePathUI();
+                    return;
+                }
+
+                await exportAudioCacheToFolder(h); // Pass handle directly
                 await updateAudioPoolStats();
             };
         }
@@ -1833,6 +2306,70 @@
             };
         }
 
+        // ==================== Preset Management Bindings ====================
+        const populatePresetUI = () => {
+            const root = getRootSettings();
+            const selectEl = panel.querySelector('#indextts-preset-select');
+            const nameEl = panel.querySelector('#indextts-preset-name');
+            if (!selectEl || !nameEl) return;
+
+            selectEl.innerHTML = Object.keys(root.presets).map(name =>
+                `<option value="${name}"${name === root.selected_preset ? ' selected' : ''}>${name}</option>`
+            ).join('');
+            nameEl.value = root.selected_preset;
+        };
+
+        populatePresetUI();
+
+        // Preset Select change → 使用 switchPreset 移除重绘
+        const presetSelect = panel.querySelector('#indextts-preset-select');
+        if (presetSelect) {
+            presetSelect.onchange = () => {
+                switchPreset(presetSelect.value);
+            };
+        }
+
+        // Preset Save
+        const presetSaveBtn = panel.querySelector('#indextts-preset-save');
+        if (presetSaveBtn) {
+            presetSaveBtn.onclick = () => {
+                const root = getRootSettings();
+                const nameEl = panel.querySelector('#indextts-preset-name');
+                const name = (nameEl?.value || '').trim();
+                if (!name) {
+                    if (window.toastr) window.toastr.warning('请输入预设名称');
+                    return;
+                }
+                // 深拷贝当前活跃预设数据 保存到目标名称
+                root.presets[name] = JSON.parse(JSON.stringify(getSettings()));
+                root.selected_preset = name;
+                saveSettings();
+                populatePresetUI();
+                if (window.toastr) window.toastr.success(`预设 "${name}" 已保存`);
+            };
+        }
+
+        // Preset Delete
+        const presetDelBtn = panel.querySelector('#indextts-preset-delete');
+        if (presetDelBtn) {
+            presetDelBtn.onclick = () => {
+                const root = getRootSettings();
+                const keys = Object.keys(root.presets);
+                if (keys.length <= 1) {
+                    if (window.toastr) window.toastr.warning('至少需要保留一个预设');
+                    return;
+                }
+                const current = root.selected_preset;
+                if (!confirm(`确定要删除预设 "${current}" 吗？`)) return;
+                delete root.presets[current];
+                // 切换到第一个剩余预设
+                switchPreset(Object.keys(root.presets)[0]);
+                if (window.toastr) window.toastr.success(`已删除预设 "${current}"`);
+            };
+        }
+
+        // Initial UI check
+        updatePathUI();
         updateAudioPoolStats();
     }
 
@@ -1867,13 +2404,14 @@
         return list;
     }
 
-    async function importFromLocalDirectory() {
+    async function importFromLocalDirectory(providedHandle) {
         if (!window.showDirectoryPicker) {
             if (window.toastr) window.toastr.error('当前浏览器不支持 File System Access API');
             return;
         }
         try {
-            const dirHandle = await window.showDirectoryPicker();
+            const dirHandle = providedHandle || await window.showDirectoryPicker();
+            // const dirHandle = await window.showDirectoryPicker();
             const fileHandles = await getAllAudioFilesFromDir(dirHandle);
             if (!fileHandles.length) {
                 if (window.toastr) window.toastr.info('该目录下未发现 .wav / .mp3 / .ogg 文件');
@@ -1930,7 +2468,7 @@
         }
     }
 
-    async function exportAudioCacheToFolder() {
+    async function exportAudioCacheToFolder(providedHandle) {
         if (!AudioStorage || !AudioStorage.getAllAudios) return;
         if (!window.showDirectoryPicker) {
             if (window.toastr) window.toastr.error('当前浏览器不支持 File System Access API');
@@ -1942,7 +2480,7 @@
                 if (window.toastr) window.toastr.info('暂无可导出的缓存音频');
                 return;
             }
-            const dirHandle = await window.showDirectoryPicker();
+            const dirHandle = providedHandle || await window.showDirectoryPicker();
             let idx = 0;
             for (const rec of records) {
                 idx++;
@@ -2031,6 +2569,37 @@
         } catch (e) {
             console.log('[IndexTTS2] Event source not available, using polling only');
         }
+
+        // Prompt Injection Logic
+        try {
+            const eventSource = window.eventSource || window.SillyTavern?.getContext?.()?.eventSource;
+            const event_types = window.event_types || window.SillyTavern?.getContext?.()?.event_types;
+
+            if (eventSource && event_types && event_types.CHAT_COMPLETION_PROMPT_READY) {
+                eventSource.on(event_types.CHAT_COMPLETION_PROMPT_READY, (eventData) => {
+                    const settings = getSettings();
+                    const config = settings.promptInjection;
+
+                    if (config && config.enabled && config.content) {
+                        const depth = parseInt(config.depth) || 0;
+                        const injection = {
+                            role: config.role || 'system',
+                            content: config.content
+                        };
+
+                        // Calculate insertion index
+                        let index = eventData.chat.length - depth;
+                        if (index < 0) index = 0;
+                        if (index > eventData.chat.length) index = eventData.chat.length;
+
+                        eventData.chat.splice(index, 0, injection);
+                        console.log(`[IndexTTS2] Injected prompt at depth ${depth} (index ${index})`, injection);
+                    }
+                });
+            }
+        } catch (e) {
+            console.error('[IndexTTS2] Prompt injection setup error:', e);
+        }
     }
 
     // ==================== Polling ====================
@@ -2056,6 +2625,7 @@
     function init() {
         console.log('[IndexTTS2] v12 Initializing...');
         getSettings(); // Ensure settings exist
+        LocalRepo.init();
         setupEventListeners();
         setInterval(polling, 2000);
         polling(); // Initial run
