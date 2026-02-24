@@ -1,12 +1,21 @@
+
+# v1.2.0 更新（2026-02-24）
+
+更新摘要（重点）：
+- 主要更新：增强在**未启动 IndexTTS 服务**时的可用性 —— 优先使用本地缓存/已导入音频或 IndexedDB 回退，以在离线或无后端时继续播放。
+- 新增设置控制项以精细化网络请求行为（`allowFetch` / `autoInfer`），可选择仅使用本地音频或允许回退到远端服务。
+
+详细变更与迁移说明请参见：`UPDATE_REPORT.md`
+
 # v1.1.0 更新（2026-02-14）
 
 更新摘要：
-- 重构设置管理，新增预设（presets）支持与 `getRootSettings` / `switchPreset`
-- 集成本地目录（File System Access API）用于音频导入/导出与持久句柄保存
-- 增加提示词注入（Prompt Injection）功能，可在聊天生成时按深度插入自定义提示词
-- 扩展 IndexedDB：新增 `configs` store，支持保存本地目录句柄与额外配置
-- 播放与缓存逻辑增强：支持全局播放列表（playlist）、seek、自动推理控制与容错
-- 新增 `UPDATE_REPORT.md`（仓库根目录），包含详细变更说明与迁移建议
+ - 重构设置管理，新增预设（presets）支持与 `getRootSettings` / `switchPreset`
+ - 集成本地目录（File System Access API）用于音频导入/导出与持久句柄保存
+ - 增加提示词注入（Prompt Injection）功能，可在聊天生成时按深度插入自定义提示词
+ - 扩展 IndexedDB：新增 `configs` store，支持保存本地目录句柄与额外配置
+ - 播放与缓存逻辑增强：支持全局播放列表（playlist）、seek、自动推理控制与容错
+ - 新增 `UPDATE_REPORT.md`（仓库根目录），包含详细变更说明与迁移建议
 
 详细变更请参见：`UPDATE_REPORT.md`
 

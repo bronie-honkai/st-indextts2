@@ -30,29 +30,67 @@
     };
 
     // ==================== Settings Management ====================
+
+    /**
+     * 健壮的 Context 获取辅助函数
+     * 处理 SillyTavern.getContext() 的多种访问方式
+     */
+    function getContext() {
+        try {
+            if (typeof SillyTavern !== 'undefined' && SillyTavern?.getContext) {
+                return SillyTavern.getContext();
+            }
+            if (window.SillyTavern?.getContext) {
+                return window.SillyTavern.getContext();
+            }
+        } catch (e) {
+            console.warn('[IndexTTS2] getContext error:', e);
+        }
+        return null;
+    }
+
+    /**
+     * 深度合并：将 source 的缺失字段递归补入 target
+     * target 已有的字段不会被覆盖
+     */
+    function deepMergeDefaults(target, source) {
+        if (!source || typeof source !== 'object') return target;
+        if (!target || typeof target !== 'object') return JSON.parse(JSON.stringify(source));
+        for (const key of Object.keys(source)) {
+            if (!Object.prototype.hasOwnProperty.call(target, key)) {
+                // target 缺少此字段，从 source 深拷贝补入
+                target[key] = typeof source[key] === 'object' && source[key] !== null
+                    ? JSON.parse(JSON.stringify(source[key]))
+                    : source[key];
+            } else if (
+                typeof source[key] === 'object' && source[key] !== null &&
+                !Array.isArray(source[key]) &&
+                typeof target[key] === 'object' && target[key] !== null &&
+                !Array.isArray(target[key])
+            ) {
+                // 两边都是纯对象，递归合并
+                deepMergeDefaults(target[key], source[key]);
+            }
+        }
+        return target;
+    }
+
     function getSettings() {
         // ========== 第一步：从 Context（唯一真理来源）读取 ==========
-        const ctx = window.SillyTavern?.getContext?.();
+        const ctx = getContext();
         const contextStore = ctx?.extensionSettings;
-        if (!window.extension_settings) window.extension_settings = {};
 
-        // 优先级：Context > window.extension_settings > 全新初始化
         let root = null;
         if (contextStore && contextStore[extensionName] && typeof contextStore[extensionName] === 'object') {
-            // 【最高优先级】从 Context 读取（服务器持久化数据在这里）
             root = contextStore[extensionName];
             console.debug('[IndexTTS2] Settings loaded from Context');
-        } else if (window.extension_settings[extensionName] && typeof window.extension_settings[extensionName] === 'object') {
-            // 【兼容旧版本】从 window 读取
-            root = window.extension_settings[extensionName];
-            console.debug('[IndexTTS2] Settings loaded from window (legacy fallback)');
         }
 
         // ========== 第二步：迁移旧格式 / 全新初始化 ==========
         if (!root || !root.presets) {
             const oldData = root && root.apiUrl ? root : null;
             const migratedPreset = oldData
-                ? Object.assign(JSON.parse(JSON.stringify(defaultSettings)), oldData)
+                ? deepMergeDefaults(JSON.parse(JSON.stringify(oldData)), defaultSettings)
                 : JSON.parse(JSON.stringify(defaultSettings));
             delete migratedPreset.selected_preset;
             delete migratedPreset.presets;
@@ -60,15 +98,12 @@
             console.log('[IndexTTS2] Migrated/initialized preset architecture');
         }
 
-        // ========== 第三步：双向同步引用（共享同一个对象引用） ==========
-        // 写入 Context（真正的持久化位置，最重要）
+        // ========== 第三步：写入 Context（确保后续 saveSettings 能持久化） ==========
         if (contextStore) {
             contextStore[extensionName] = root;
         }
-        // 挂载到 window.extension_settings（便利镜像，供其他代码直接访问）
-        window.extension_settings[extensionName] = root;
 
-        // ========== 第四步：校验 & 补齐当前预设 ==========
+        // ========== 第四步：校验 & 补齐当前预设（深度合并 defaultSettings） ==========
         if (!root.presets[root.selected_preset]) {
             root.selected_preset = Object.keys(root.presets)[0] || 'Default';
             if (!root.presets[root.selected_preset]) {
@@ -78,26 +113,9 @@
         }
 
         const active = root.presets[root.selected_preset];
-        for (const [key, val] of Object.entries(defaultSettings)) {
-            if (!Object.prototype.hasOwnProperty.call(active, key)) {
-                active[key] = val;
-            }
-        }
+        // 使用深度合并补齐所有缺失字段（包括 promptInjection、vnRegex 等子对象）
+        deepMergeDefaults(active, defaultSettings);
         if (typeof active.voiceMap !== 'object') active.voiceMap = {};
-
-        // Deep merge for promptInjection to ensure all sub-fields exist
-        if (!active.promptInjection || typeof active.promptInjection !== 'object') {
-            active.promptInjection = JSON.parse(JSON.stringify(defaultSettings.promptInjection));
-        } else {
-            // Fill in missing sub-fields from defaultSettings
-            for (const [key, val] of Object.entries(defaultSettings.promptInjection)) {
-                if (!Object.prototype.hasOwnProperty.call(active.promptInjection, key)) {
-                    active.promptInjection[key] = typeof val === 'object' && val !== null
-                        ? JSON.parse(JSON.stringify(val))
-                        : val;
-                }
-            }
-        }
 
         return active;
     }
@@ -105,42 +123,34 @@
     /** 返回顶层根对象 { selected_preset, presets }，供 UI 层使用 */
     function getRootSettings() {
         getSettings(); // 确保初始化/迁移/同步完成
-        // 强制从 Context 返回（唯一真理来源）
-        const ctx = window.SillyTavern?.getContext?.();
+        const ctx = getContext();
         if (ctx?.extensionSettings?.[extensionName]) {
             return ctx.extensionSettings[extensionName];
         }
-        // 极端降级：Context 不可用时用 window
-        return window.extension_settings[extensionName];
+        return null;
     }
 
     function saveSettings() {
-        // 第一步：从 Context（唯一真理来源）获取 root
-        const ctx = window.SillyTavern?.getContext?.();
-        let root = ctx?.extensionSettings?.[extensionName];
-        // 降级：如果 Context 里没有，尝试 window
-        if (!root) root = window.extension_settings?.[extensionName];
-        if (!root) {
-            console.warn('[IndexTTS2] saveSettings: no root data found, skipping');
+        const ctx = getContext();
+        if (!ctx?.extensionSettings) {
+            console.warn('[IndexTTS2] saveSettings: Context not available, cannot persist');
             return;
         }
 
-        // 第二步：通过 _.set 写入 Context（官方持久化路径）
-        try {
-            if (ctx?.extensionSettings && typeof _ !== 'undefined' && _.set) {
-                _.set(ctx.extensionSettings, extensionName, root);
-            }
-        } catch (e) {
-            console.warn('[IndexTTS2] _.set fallback:', e);
+        // 确保当前内存中的设置已写入 Context
+        const root = ctx.extensionSettings[extensionName];
+        if (!root) {
+            console.warn('[IndexTTS2] saveSettings: no root data in Context, skipping');
+            return;
         }
 
-        // 第三步：同步到 window（保持引用一致性）
-        if (!window.extension_settings) window.extension_settings = {};
-        window.extension_settings[extensionName] = root;
-
-        // 第四步：触发异步落盘
-        if (typeof window.saveSettingsDebounced === 'function') {
-            window.saveSettingsDebounced();
+        // 触发 SillyTavern 的持久化保存
+        if (typeof ctx.saveSettingsDebounced === 'function') {
+            ctx.saveSettingsDebounced();
+        } else if (typeof ctx.saveSettings === 'function') {
+            ctx.saveSettings();
+        } else {
+            console.warn('[IndexTTS2] saveSettings: no save function available on Context');
         }
     }
 
@@ -475,8 +485,9 @@
         return { init, setHandle, getHandle, requestPermission };
     })();
 
-    async function generateHash(character, voiceId, text, speed, volume) {
-        const input = `${character || ''}|${voiceId || ''}|${speed}|${volume}|${text || ''}`;
+    async function generateHash(character, voiceId, text, speed, volume, emotion) {
+        const emotionPart = emotion ? `|${emotion}` : '';
+        const input = `${character || ''}|${voiceId || ''}|${speed}|${volume}|${text || ''}${emotionPart}`;
         try {
             const encoder = new TextEncoder();
             const data = encoder.encode(input);
@@ -590,20 +601,31 @@
             const trimmed = (text || '').trim().replace(/\s+/g, ' ').trim();
             if (!trimmed) return null;
 
+            // 提取可选的情感向量 [数字,数字,...]
+            let emotion = null;
+            try {
+                const emotionMatch = trimmed.match(/\]\s*\[([\d.,\s-]+)\]/);
+                if (emotionMatch) {
+                    emotion = emotionMatch[1].replace(/\s/g, '');
+                }
+            } catch (_) { /* 格式错误时静默忽略 */ }
+
             // 格式 A: [角色|表情]|「对话」 或 [角色]|「对话」，宽松 \s*
-            const pipeRegex = /^\s*\[([^|\]\n]+)(?:\|[^\]\n]*)?\]\s*\|\s*([「""『](.*?)[」""』])\s*$/;
+            // 新增：可选匹配情感向量 [角色|表情][情感向量]|「对话」
+            const pipeRegex = /^\s*\[([^|\]\n]+)(?:\|[^\]\n]*)?\](?:\[[\d.,\s-]*\])?\s*\|\s*([「""『](.*?)[」""』])\s*$/;
             let match = trimmed.match(pipeRegex);
             if (match) {
                 const character = (match[1] || '').replace(/\s+/g, ' ').trim();
                 const quoted = (match[2] || '').trim();
                 const inner = (match[3] || '').trim();
                 if (character && inner) {
-                    return { character, dialogue: inner, rawContent: quoted, quoted, isAction: false, isQuoted: true };
+                    return { character, dialogue: inner, rawContent: quoted, quoted, isAction: false, isQuoted: true, emotion };
                 }
             }
 
             // 格式 B: [角色][表情] 对话 或 [角色] 对话（无竖线）
-            const bracketRegex = /^\s*\[([^\]]+)\](?:\[[^\]]*\])?\s+(.+)\s*$/;
+            // 新增：可选匹配情感向量 [角色][表情][情感向量] 对话
+            const bracketRegex = /^\s*\[([^\]]+)\](?:\[[^\]]*\])?(?:\[[\d.,\s-]*\])?\s+(.+)\s*$/;
             match = trimmed.match(bracketRegex);
             if (match) {
                 const character = (match[1] || '').replace(/\s+/g, ' ').trim();
@@ -612,7 +634,7 @@
                 const quoteMatch = content.match(/^[「""『](.*?)[」""』]\s*$/);
                 const dialogue = quoteMatch ? quoteMatch[1].trim() : content;
                 if (!dialogue) return null;
-                return { character, dialogue, rawContent: content, quoted: content, isAction: false, isQuoted: !!quoteMatch };
+                return { character, dialogue, rawContent: content, quoted: content, isAction: false, isQuoted: !!quoteMatch, emotion };
             }
 
             // 格式 C: [角色] 内容（无引号，仅 [角色] 后跟空白与内容）
@@ -622,7 +644,7 @@
                 const character = (match[1] || '').replace(/\s+/g, ' ').trim();
                 const dialogue = (match[2] || '').trim();
                 if (character && dialogue) {
-                    return { character, dialogue, rawContent: dialogue, quoted: dialogue, isAction: false, isQuoted: false };
+                    return { character, dialogue, rawContent: dialogue, quoted: dialogue, isAction: false, isQuoted: false, emotion };
                 }
             }
 
@@ -653,7 +675,7 @@
     }
 
     // ==================== TTS API & Cache Flow ====================
-    async function ensureAudioRecord({ text, character, voice, allowFetch = true }) {
+    async function ensureAudioRecord({ text, character, voice, allowFetch = true, emotion = null }) {
         if (!text?.trim()) return null;
         const settings = getSettings();
         // Use default voice if specific voice not set, UNLESS we want to be strict (but ensureAudioRecord is usually for playback).
@@ -661,7 +683,7 @@
         const normVoice = ensureWavSuffix(voice || settings.defaultVoice);
         const speed = parseFloat(settings.speed || 1.0) || 1.0;
         const volume = parseFloat(settings.volume || 1.0) || 1.0;
-        const hash = await generateHash(character || 'Unknown', normVoice, text, speed, volume);
+        const hash = await generateHash(character || 'Unknown', normVoice, text, speed, volume, emotion);
 
         // 先查 IndexedDB 缓存
         try {
@@ -695,14 +717,26 @@
             response_format: 'wav',
             speed: speed,
         };
+        if (emotion) {
+            const emoVec = emotion.split(',').map(v => parseFloat(v.trim()));
+            if (emoVec.length === 8 && emoVec.every(v => !isNaN(v))) {
+                payload.emo_control_method = 2;
+                payload.emo_vec = emoVec;
+                payload.emo_weight = 0.6;
+            }
+        }
 
         try {
+            const controller = new AbortController();
+            const timeoutId = setTimeout(() => controller.abort(), 3000);
             const res = await fetch(settings.apiUrl, {
                 method: 'POST',
                 mode: 'cors',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify(payload),
+                signal: controller.signal,
             });
+            clearTimeout(timeoutId);
 
             if (!res.ok) {
                 const errText = await res.text().catch(() => '');
@@ -728,6 +762,13 @@
 
             return record;
         } catch (e) {
+            // 网络连接失败（服务未启动、超时等）→ 优雅降级
+            const isNetworkError = e.name === 'AbortError' || e.message?.includes('Failed to fetch') || e.message?.includes('NetworkError');
+            if (isNetworkError) {
+                console.warn('[IndexTTS2] 后端服务未连接，尝试仅使用本地缓存');
+                console.warn('[IndexTTS2] TTS服务未启动且本地无缓存:', hash);
+                return null;
+            }
             console.error('[IndexTTS2] TTS API Error:', e);
             throw e;
         }
@@ -738,6 +779,7 @@
         const ctx = context || {};
         // Explicitly check for false, default to true
         const allowFetch = ctx.autoInfer === false ? false : true;
+        const emotion = ctx.emotion || null;
         let msg = ctx.msg || null;
         const encT = ctx.encT || utf8ToBase64(text);
         const encC = ctx.encC || utf8ToBase64(character || '');
@@ -776,8 +818,14 @@
 
         let record;
         try {
-            record = await ensureAudioRecord({ text, character, voice: finalVoice, allowFetch });
-            if (!record) return;
+            record = await ensureAudioRecord({ text, character, voice: finalVoice, allowFetch, emotion });
+            if (!record) {
+                // allowFetch 为 true 却拿不到 record → 网络失败且缓存未命中
+                if (allowFetch && window.toastr) {
+                    window.toastr.warning('IndexTTS 服务未启动，仅能播放已预处理的音频');
+                }
+                return;
+            }
         } catch (e) {
             if (window.toastr) window.toastr.error('TTS失败: ' + e.message);
             return;
@@ -1254,6 +1302,7 @@
             // Encode dialogue & character for data attribute
             const enc = utf8ToBase64(vn.parsed.dialogue);
             const charEnc = utf8ToBase64(vn.parsed.character);
+            const emotionEnc = vn.parsed.emotion || '';
 
             // 仅在原 HTML 中查找「带引号的对话」部分（第二组）
             const dialogueContent = vn.parsed.rawContent;
@@ -1270,7 +1319,7 @@
                 if (match.includes('indextts-dialogue')) return match;
                 modified = true;
 
-                return `<span class="indextts-dialogue" data-t="${enc}" data-v="${vn.voice || ''}" data-c="${charEnc}" title="点击播放">${match}</span><span class="indextts-inline-play" data-t="${enc}" data-v="${vn.voice || ''}" data-c="${charEnc}" title="播放"><i class="fa-solid fa-play fa-xs"></i></span>`;
+                return `<span class="indextts-dialogue" data-t="${enc}" data-v="${vn.voice || ''}" data-c="${charEnc}" data-e="${emotionEnc}" title="点击播放">${match}</span><span class="indextts-inline-play" data-t="${enc}" data-v="${vn.voice || ''}" data-c="${charEnc}" data-e="${emotionEnc}" title="播放"><i class="fa-solid fa-play fa-xs"></i></span>`;
             });
         }
 
@@ -1286,8 +1335,9 @@
                     const text = base64ToUtf8(span.dataset.t);
                     const voice = span.dataset.v;
                     const character = base64ToUtf8(span.dataset.c || '');
+                    const emotion = span.dataset.e || null;
                     const msgEl = span.closest('.mes');
-                    playSingleLine(text, voice, character, { msg: msgEl, encT: span.dataset.t, encC: span.dataset.c });
+                    playSingleLine(text, voice, character, { msg: msgEl, encT: span.dataset.t, encC: span.dataset.c, emotion });
                 };
             });
 
@@ -1300,8 +1350,9 @@
                     const text = base64ToUtf8(btn.dataset.t);
                     const voice = btn.dataset.v;
                     const character = base64ToUtf8(btn.dataset.c || '');
+                    const emotion = btn.dataset.e || null;
                     const msgEl = btn.closest('.mes');
-                    playSingleLine(text, voice, character, { msg: msgEl, encT: btn.dataset.t, encC: btn.dataset.c });
+                    playSingleLine(text, voice, character, { msg: msgEl, encT: btn.dataset.t, encC: btn.dataset.c, emotion });
                 };
             });
         }
@@ -1379,6 +1430,7 @@
                     text: parsed.dialogue,
                     character: parsed.character,
                     voice: voice !== undefined && voice !== null && voice !== '' ? voice : undefined,
+                    emotion: parsed.emotion || null,
                 });
             }
         }
@@ -1672,6 +1724,7 @@
                             text: line.text,
                             character: line.character,
                             voice: line.voice,
+                            emotion: line.emotion,
                         });
                         if (!record) continue;
                         const blobUrl = URL.createObjectURL(record.blob);
@@ -1690,16 +1743,22 @@
 
             audioCache[mesId] = list;
 
+            // 统计因网络失败而跳过的行数（有配音但未生成记录）
+            const voicedLines = lines.filter(l => l.voice);
+            const networkSkipped = voicedLines.length - list.length - 0; // 0 placeholder for other skip reasons
+
             if (list.length) {
                 const playBtn = msg.querySelector('.indextts-play');
                 if (playBtn) playBtn.classList.add('indextts-prepared');
                 if (window.toastr && !isSilent) {
-                    if (unvoicedCount > 0 && unvoicedCount < lines.length) {
-                        window.toastr.success(`已推理 ${list.length} 句音频，${unvoicedCount} 句未配置配音已跳过`);
-                    } else {
-                        window.toastr.success(`已推理 ${list.length} 句音频`);
-                    }
+                    let detail = `已准备 ${list.length} 句音频`;
+                    if (unvoicedCount > 0) detail += `，${unvoicedCount} 句未配置配音已跳过`;
+                    if (networkSkipped > 0) detail += `，${networkSkipped} 句因服务离线无缓存已跳过`;
+                    window.toastr.success(detail);
                 }
+            } else if (voicedLines.length > 0 && !isSilent && window.toastr) {
+                // 全部有配音行都失败了（没有一句缓存命中）
+                window.toastr.warning('IndexTTS 服务未启动，仅能播放已预处理的音频');
             }
 
             return list;
@@ -2624,7 +2683,8 @@
     // ==================== Initialize ====================
     function init() {
         console.log('[IndexTTS2] v12 Initializing...');
-        getSettings(); // Ensure settings exist
+        const loadedSettings = getSettings(); // Ensure settings exist
+        console.log('[IndexTTS2] Loaded settings:', loadedSettings);
         LocalRepo.init();
         setupEventListeners();
         setInterval(polling, 2000);
