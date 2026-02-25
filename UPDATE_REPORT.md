@@ -1,3 +1,60 @@
+# v1.3.0 更新说明（2026-02-25）
+
+更新摘要：
+- 版本号：v1.3.0（在 `manifest.json` 中已更新）
+- 主要目标：提升离线与无后端场景下的可用性、增强设置迁移稳定性以及改进播放与缓存的健壮性。
+
+关键变更：
+
+1. 离线与回退策略优化
+   - 增强了对本地缓存（IndexedDB）与已导入音频的优先使用，能够在 IndexTTS 服务不可用时回退到本地播放，减少用户中断感。
+   - 在 IndexedDB 中新增/完善 `configs` store（见 `index.js` 中的打开逻辑），音频持久化与配置更可靠。
+
+2. 设置与预设框架改进
+   - 引入并稳定了预设（presets）结构：`getRootSettings`、`switchPreset` 与 `saveSettings` 支持完整迁移与深度补齐默认值（`deepMergeDefaults`）。
+   - 改进了向后兼容的迁移逻辑：旧版扁平设置会自动迁移为 `presets` 结构并保留用户自定义值。
+
+3. 更健壮的运行时环境检测与容错
+   - 新增更健壮的 `getContext()` 获取方式，兼容多种 SillyTavern 上下文访问形式并捕获错误，避免在特殊环境下直接抛错导致扩展崩溃。
+   - 更完善的音频缓存清理（`clearMemoryAudioCache`）与播放状态管理，能更安全地释放 Blob URL 并重置播放状态。
+
+4. 播放器与用户体验改进
+   - 迷你播放器、播放列表与控制器结构增强，支持更稳定的 seek/播放控制和会话管理。
+   - 行内播放、解析模式（GAL / Audiobook）和自动推理（`autoInference`）的默认行为与配置更加直观。
+
+5. 开发与兼容性改进
+   - 代码中加强了对文件名后缀的保障（`ensureWavSuffix`）、样式加载检查（`ensureCssLoaded`）等小修复，提升跨平台兼容性。
+
+迁移与注意事项：
+- 升级到 v1.3.0 时，扩展会尝试自动将旧版设置迁移为新的 `presets` 架构；建议在升级前备份原有设置与 IndexedDB（若你保存了自定义音频）。
+- 如果你使用自建 IndexTTS 服务：请确认 `manifest.json` / 设置中的 `apiUrl` 与 `cloningUrl` 配置正确。
+- 如果出现远程推送或网络调用失败，扩展会优先使用本地缓存音频（若存在）。
+
+已包含的文件（新版本目录）：
+- index.js
+- manifest.json （version: 1.3.0）
+- style.css
+- README.md
+- test.py / test-japanese.py（测试脚本）
+
+提交与发布建议（Git 操作示例）：
+```powershell
+cd <your-repo-root>
+git checkout -b release/st-indextts2-v1.3.0
+git add public/scripts/extensions/third-party/st-indextts2-new/
+git commit -m "chore(st-indextts2): release v1.3.0 — 增强离线回退与设置迁移"
+git tag -a v1.3.0 -m "st-indextts2 v1.3.0"
+git push origin HEAD
+git push origin --tags
+```
+
+如果你需要，我可以在当前工作区里执行上述提交与推送命令（需要本机已配置 Git 凭据并能访问远程仓库）。
+
+问题反馈与后续计划：
+- 建议把升级后的 `manifest.json` 与 `UPDATE_REPORT.md` 一并提交到仓库，并在 Release 中附上升级说明与常见问题（FAQ）。
+- 后续可以增加自动化升级检测与一键备份导出功能，便于用户在升级前保存自定义音频与设置。
+
+— kirara
 ```markdown
 # st-indextts2 更新报告
 

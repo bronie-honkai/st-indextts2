@@ -277,16 +277,36 @@
         if (currentPlayback.audio) {
             try { currentPlayback.audio.pause(); } catch (e) { }
         }
-        currentPlayback = { audio: null, msg: null, mesId: null, index: -1 };
+        currentPlayback = {
+            audio: null, msg: null, mesId: null, index: -1, sessionId: null, stop: function () {
+                if (this.audio) {
+                    try {
+                        this.audio.pause();
+                        this.audio.onended = null;
+                        this.audio.onerror = null;
+                    } catch (e) { }
+                }
+                this.audio = null;
+                this.msg = null;
+                this.mesId = null;
+                this.index = -1;
+                this.sessionId = null;
+            }
+        };
     }
 
     function getMessageId(msg) {
         if (!msg) return null;
-        const mesIdAttr = msg.getAttribute('mesid') || msg.dataset.mesid;
-        if (mesIdAttr !== undefined && mesIdAttr !== null) return String(mesIdAttr);
+        let mesIdAttr = msg.getAttribute('mesid');
+        if (!mesIdAttr) mesIdAttr = msg.dataset?.mesid;
+        if (!mesIdAttr) mesIdAttr = msg.getAttribute('data-mesid');
+
+        if (mesIdAttr) return String(mesIdAttr);
+
+        // Fallback to finding index in the message list
         const list = Array.from(document.querySelectorAll('.mes'));
         const idx = list.indexOf(msg);
-        return idx >= 0 ? `idx_${idx}` : null;
+        return idx >= 0 ? String(idx) : null;
     }
 
     function utf8ToBase64(str) {
@@ -698,6 +718,7 @@
                     voice: normVoice,
                     speed,
                     volume,
+                    isCached: true
                 };
             }
         } catch (e) {
@@ -727,16 +748,12 @@
         }
 
         try {
-            const controller = new AbortController();
-            const timeoutId = setTimeout(() => controller.abort(), 3000);
             const res = await fetch(settings.apiUrl, {
                 method: 'POST',
                 mode: 'cors',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify(payload),
-                signal: controller.signal,
             });
-            clearTimeout(timeoutId);
 
             if (!res.ok) {
                 const errText = await res.text().catch(() => '');
@@ -753,6 +770,7 @@
                 speed,
                 volume,
                 timestamp: Date.now(),
+                isCached: false
             };
 
             // 持久化保存
@@ -762,14 +780,11 @@
 
             return record;
         } catch (e) {
-            // 网络连接失败（服务未启动、超时等）→ 优雅降级
-            const isNetworkError = e.name === 'AbortError' || e.message?.includes('Failed to fetch') || e.message?.includes('NetworkError');
-            if (isNetworkError) {
-                console.warn('[IndexTTS2] 后端服务未连接，尝试仅使用本地缓存');
-                console.warn('[IndexTTS2] TTS服务未启动且本地无缓存:', hash);
+            console.error('[IndexTTS2] TTS API Error:', e);
+            if (e instanceof TypeError || (e.message && (e.message.includes('Failed to fetch') || e.message.includes('NetworkError')))) {
+                console.warn('后端离线，仅使用本地缓存');
                 return null;
             }
-            console.error('[IndexTTS2] TTS API Error:', e);
             throw e;
         }
     }
@@ -819,13 +834,7 @@
         let record;
         try {
             record = await ensureAudioRecord({ text, character, voice: finalVoice, allowFetch, emotion });
-            if (!record) {
-                // allowFetch 为 true 却拿不到 record → 网络失败且缓存未命中
-                if (allowFetch && window.toastr) {
-                    window.toastr.warning('IndexTTS 服务未启动，仅能播放已预处理的音频');
-                }
-                return;
-            }
+            if (!record) return;
         } catch (e) {
             if (window.toastr) window.toastr.error('TTS失败: ' + e.message);
             return;
@@ -1672,6 +1681,391 @@
         timeUpdate();
     }
 
+    // ==================== Floating Player Window (TTSPlayerWindow) ====================
+    const TTSPlayerWindow = (() => {
+        let container = null;
+        let elements = {};
+        let dragInfo = { isDragging: false, startX: 0, startY: 0, initialLeft: 0, initialTop: 0 };
+        let currentTotalDuration = 0;
+        let globalController = null;
+        let lastVolume = 1.0;
+        let hideTimer = null;
+        const speedCycle = [0.25, 0.5, 1.0, 1.25, 1.5, 2.0, 3.0];
+
+        function init() {
+            if (container) return;
+            container = document.createElement('div');
+            container.className = 'indextts-player-window';
+            container.innerHTML = `
+                <div class="indextts-player-top" style="cursor: move;">
+                    <div class="indextts-player-cover">
+                        <img id="indextts-player-avatar" src="" alt="avatar" style="display:none;" onerror="this.style.display='none';this.parentElement.innerHTML='<i class=\\'fa-solid fa-music\\'></i>'">
+                    </div>
+                    <div class="indextts-player-info">
+                        <div class="indextts-player-charname" id="indextts-player-name">Name</div>
+                        <div class="indextts-player-text">
+                            <span class="indextts-player-text-inner" id="indextts-player-currtext">...</span>
+                        </div>
+                    </div>
+                    
+                    <div class="indextts-player-speed-area">
+                        <div class="indextts-player-speed-btn" id="indextts-player-speed-disp" title="右键原位编辑\n左键循环倍速\n悬停滑块细调">1.0x</div>
+                        <div class="indextts-player-speed-popup">
+                            <input type="range" class="indextts-speed-slider" id="indextts-player-speed-slider" min="0.1" max="3" step="0.1" value="1.0" orient="vertical">
+                        </div>
+                    </div>
+
+                    <div class="indextts-player-volume-area">
+                        <div class="indextts-player-volume-btn" id="indextts-player-volume-icon" title="右键原位编辑\n左键静音及恢复\n悬停滑块细调"><i class="fa-solid fa-volume-high"></i></div>
+                        <div class="indextts-player-volume-popup">
+                            <input type="range" class="indextts-volume-slider" id="indextts-player-volume-slider" min="0" max="2" step="0.05" value="1.0" orient="vertical">
+                        </div>
+                    </div>
+
+                    <div class="indextts-player-controls">
+                        <button class="indextts-ctrl-btn" id="indextts-player-prev" title="上一楼层"><i class="fa-solid fa-backward-step"></i></button>
+                        <button class="indextts-ctrl-btn play-btn" id="indextts-player-play"><i class="fa-solid fa-play"></i></button>
+                        <button class="indextts-ctrl-btn" id="indextts-player-next" title="下一楼层"><i class="fa-solid fa-forward-step"></i></button>
+                    </div>
+                    <button class="indextts-player-close" id="indextts-player-close" title="退出全文朗读"><i class="fa-solid fa-xmark"></i></button>
+                </div>
+                <div class="indextts-player-bottom">
+                    <input type="range" class="indextts-player-progress" id="indextts-player-progress" min="0" max="1000" value="0">
+                    <div class="indextts-player-time">
+                        <span id="indextts-player-time-curr">0:00</span>
+                        <span id="indextts-player-time-left">-0:00</span>
+                    </div>
+                </div>
+            `;
+            document.body.appendChild(container);
+
+            elements = {
+                avatar: container.querySelector('#indextts-player-avatar'),
+                name: container.querySelector('#indextts-player-name'),
+                currText: container.querySelector('#indextts-player-currtext'),
+                speedBtn: container.querySelector('#indextts-player-speed-disp'),
+                speedSlider: container.querySelector('#indextts-player-speed-slider'),
+                speedPopup: container.querySelector('.indextts-player-speed-popup'),
+                volumeBtn: container.querySelector('#indextts-player-volume-icon'),
+                volumeSlider: container.querySelector('#indextts-player-volume-slider'),
+                volumePopup: container.querySelector('.indextts-player-volume-popup'),
+                btnPrev: container.querySelector('#indextts-player-prev'),
+                btnPlay: container.querySelector('#indextts-player-play'),
+                btnNext: container.querySelector('#indextts-player-next'),
+                btnClose: container.querySelector('#indextts-player-close'),
+                progress: container.querySelector('#indextts-player-progress'),
+                timeCurr: container.querySelector('#indextts-player-time-curr'),
+                timeLeft: container.querySelector('#indextts-player-time-left'),
+                topArea: container.querySelector('.indextts-player-top')
+            };
+
+            // Bind Events
+            elements.btnClose.addEventListener('click', hide);
+
+            elements.btnPlay.addEventListener('click', () => {
+                if (!globalController) return;
+                const icon = elements.btnPlay.querySelector('i');
+                if (icon.classList.contains('fa-pause')) {
+                    globalController.pause();
+                } else {
+                    globalController.play();
+                }
+            });
+
+            elements.progress.addEventListener('input', (e) => {
+                if (!globalController) return;
+                const percent = parseInt(e.target.value, 10) / 1000;
+                globalController.seek(percent);
+            });
+
+            // --- Speed Logic ---
+            const updateSpeed = (val) => {
+                val = parseFloat(val);
+                if (isNaN(val)) return;
+                val = Math.max(0.1, Math.min(3.0, val));
+                elements.speedBtn.textContent = val.toFixed(1) + 'x';
+                elements.speedSlider.value = val;
+                const s = getSettings();
+                s.speed = val;
+                saveSettings();
+                syncMiniPlayerSpeedUI(val);
+                if (currentPlayback.audio) {
+                    currentPlayback.audio.playbackRate = val;
+                }
+            };
+
+            elements.speedBtn.addEventListener('click', () => {
+                const current = parseFloat(getSettings().speed || 1.0);
+                let next = speedCycle[0];
+                for (let i = 0; i < speedCycle.length; i++) {
+                    if (speedCycle[i] > current + 0.01) {
+                        next = speedCycle[i];
+                        break;
+                    }
+                }
+                updateSpeed(next);
+            });
+
+            elements.speedSlider.addEventListener('input', (e) => updateSpeed(e.target.value));
+
+            // --- Volume Logic ---
+            const updateVolume = (val, save = true) => {
+                val = parseFloat(val);
+                if (isNaN(val)) return;
+                val = Math.max(0, Math.min(2.0, val));
+                elements.volumeSlider.value = val;
+
+                const icon = elements.volumeBtn.querySelector('i');
+                if (icon) {
+                    if (val === 0) icon.className = 'fa-solid fa-volume-xmark';
+                    else if (val < 0.5) icon.className = 'fa-solid fa-volume-low';
+                    else icon.className = 'fa-solid fa-volume-high';
+                }
+
+                if (save) {
+                    const s = getSettings();
+                    s.volume = val;
+                    saveSettings();
+                    if (val > 0) lastVolume = val;
+                }
+                if (currentPlayback.audio) {
+                    currentPlayback.audio.volume = Math.min(1.0, val);
+                }
+            };
+
+            elements.volumeBtn.addEventListener('click', () => {
+                const s = getSettings();
+                if (parseFloat(s.volume) > 0) {
+                    lastVolume = parseFloat(s.volume);
+                    updateVolume(0);
+                } else {
+                    updateVolume(lastVolume || 1.0);
+                }
+            });
+
+            elements.volumeSlider.addEventListener('input', (e) => updateVolume(e.target.value));
+
+            // --- Inline Edit Logic ---
+            const setupInlineEdit = (btnEl, currentValueGetter, valSetter) => {
+                btnEl.addEventListener('contextmenu', (e) => {
+                    e.preventDefault();
+                    if (btnEl.querySelector('input')) return;
+
+                    const originalHTML = btnEl.innerHTML;
+                    const input = document.createElement('input');
+                    input.type = 'number';
+                    input.className = 'indextts-inline-edit-input';
+                    input.value = currentValueGetter();
+                    input.step = '0.1';
+
+                    btnEl.innerHTML = '';
+                    btnEl.appendChild(input);
+
+                    input.focus();
+                    input.select();
+
+                    const finishEdit = (save) => {
+                        btnEl.innerHTML = originalHTML;
+                        if (save) {
+                            let val = parseFloat(input.value);
+                            if (btnEl === elements.volumeBtn && val > 2.0) {
+                                val = val / 100.0;
+                            }
+                            valSetter(val);
+                        }
+                    };
+
+                    input.addEventListener('keydown', (e) => {
+                        if (e.key === 'Enter') {
+                            e.preventDefault();
+                            finishEdit(true);
+                        }
+                        if (e.key === 'Escape') finishEdit(false);
+                    });
+                    input.addEventListener('blur', () => finishEdit(false));
+                });
+            };
+
+            setupInlineEdit(elements.speedBtn, () => parseFloat(getSettings().speed || 1.0), updateSpeed);
+            setupInlineEdit(elements.volumeBtn, () => parseFloat(getSettings().volume || 1.0), updateVolume);
+
+            // --- Hover Delay Popup Logic ---
+            const setupPopup = (areaClass, popupEl) => {
+                const area = container.querySelector(`.${areaClass}`);
+                const show = () => {
+                    if (hideTimer) {
+                        clearTimeout(hideTimer);
+                        hideTimer = null;
+                    }
+                    if (popupEl !== elements.speedPopup) elements.speedPopup.classList.remove('visible');
+                    if (popupEl !== elements.volumePopup) elements.volumePopup.classList.remove('visible');
+                    popupEl.classList.add('visible');
+                };
+                const hide = () => {
+                    hideTimer = setTimeout(() => {
+                        popupEl.classList.remove('visible');
+                    }, 500);
+                };
+                area.addEventListener('mouseenter', show);
+                area.addEventListener('mouseleave', hide);
+                popupEl.addEventListener('mouseenter', show);
+                popupEl.addEventListener('mouseleave', hide);
+            };
+
+            setupPopup('indextts-player-speed-area', elements.speedPopup);
+            setupPopup('indextts-player-volume-area', elements.volumePopup);
+
+            // Dragging Logic
+            elements.topArea.addEventListener('mousedown', (e) => {
+                if (e.target.closest('.indextts-ctrl-btn') || e.target.closest('.indextts-player-close') || e.target.closest('.indextts-player-speed-area') || e.target.closest('.indextts-player-volume-area')) return;
+                dragInfo.isDragging = true;
+                dragInfo.startX = e.clientX;
+                dragInfo.startY = e.clientY;
+                const rect = container.getBoundingClientRect();
+                dragInfo.initialLeft = rect.left;
+                dragInfo.initialTop = rect.top;
+                container.style.transform = 'none'; // Clear translate transform for absolute positioning
+                container.style.left = dragInfo.initialLeft + 'px';
+                container.style.top = dragInfo.initialTop + 'px';
+                container.style.bottom = 'auto';
+            });
+            document.addEventListener('mousemove', (e) => {
+                if (!dragInfo.isDragging) return;
+                const dx = e.clientX - dragInfo.startX;
+                const dy = e.clientY - dragInfo.startY;
+                container.style.left = (dragInfo.initialLeft + dx) + 'px';
+                container.style.top = (dragInfo.initialTop + dy) + 'px';
+            });
+            document.addEventListener('mouseup', () => { dragInfo.isDragging = false; });
+
+            // Floor Nav
+            elements.btnPrev.addEventListener('click', () => navigateFloor(-1));
+            elements.btnNext.addEventListener('click', () => navigateFloor(1));
+        }
+
+        function formatTime(seconds) {
+            if (!seconds || isNaN(seconds)) return '0:00';
+            const m = Math.floor(seconds / 60);
+            const s = Math.floor(seconds % 60);
+            return `${m}:${s.toString().padStart(2, '0')}`;
+        }
+
+        function updateProgress(elapsed, total) {
+            if (!container || !container.classList.contains('visible')) return;
+            currentTotalDuration = total;
+            const percent = total > 0 ? Math.min(1, Math.max(0, elapsed / total)) : 0;
+            elements.progress.value = Math.floor(percent * 1000);
+            elements.timeCurr.textContent = formatTime(elapsed);
+            elements.timeLeft.textContent = '-' + formatTime(total - elapsed);
+        }
+
+        function updatePlayState(isPlaying) {
+            if (!container) return;
+            elements.btnPlay.innerHTML = isPlaying ? '<i class="fa-solid fa-pause"></i>' : '<i class="fa-solid fa-play"></i>';
+        }
+
+        function updateInfo(data) {
+            if (!container) return;
+            if (data.name) elements.name.textContent = data.name;
+            if (data.text) {
+                const text = data.text;
+                elements.currText.textContent = text;
+                elements.currText.classList.remove('marquee');
+                elements.currText.style.animationDuration = '0s';
+
+                // Seamless Marquee: clone text if overflow
+                setTimeout(() => {
+                    const parent = elements.currText.parentElement;
+                    if (elements.currText.scrollWidth > parent.clientWidth + 5) {
+                        elements.currText.innerHTML = `${text} <span style="margin-right:50px;"></span> ${text}`;
+                        elements.currText.classList.add('marquee');
+                        const duration = Math.max(10, Math.floor(elements.currText.scrollWidth / 40));
+                        elements.currText.style.animationDuration = `${duration}s`;
+                    }
+                }, 50);
+            }
+            if (data.avatarUrl) {
+                elements.avatar.src = data.avatarUrl;
+                elements.avatar.style.display = 'block';
+                elements.avatar.parentElement.querySelector('i')?.remove();
+            }
+        }
+
+        function navigateFloor(direction) {
+            if (!currentPlayback.msg) return;
+            const currentMsg = currentPlayback.msg;
+            const allMes = Array.from(document.querySelectorAll('.mes[is_user="false"]'));
+            const currentIndex = allMes.indexOf(currentMsg);
+
+            if (currentIndex === -1) return;
+
+            let targetMsg = null;
+            let iterIndex = currentIndex + direction;
+
+            while (iterIndex >= 0 && iterIndex < allMes.length) {
+                const tempMsg = allMes[iterIndex];
+                if (tempMsg.querySelector('.indextts-play')) {
+                    targetMsg = tempMsg;
+                    break;
+                }
+                iterIndex += direction;
+            }
+
+            if (targetMsg) {
+                const btn = targetMsg.querySelector('.indextts-play');
+                if (btn) btn.click();
+            } else {
+                if (window.toastr) window.toastr.info(direction === 1 ? '已经是最后一个有效楼层' : '已经是第一个有效楼层');
+            }
+        }
+
+        function show(msg, controller) {
+            init();
+            globalController = controller;
+
+            // Sync current speed & volume
+            const settings = getSettings();
+            const speed = parseFloat(settings.speed || 1.0);
+            const volume = parseFloat(settings.volume || 1.0);
+
+            elements.speedBtn.textContent = speed.toFixed(1) + 'x';
+            elements.speedSlider.value = speed;
+
+            elements.volumeSlider.value = volume;
+            lastVolume = volume > 0 ? volume : (lastVolume || 1.0);
+
+            const vIcon = elements.volumeBtn.querySelector('i');
+            if (vIcon) {
+                if (volume === 0) vIcon.className = 'fa-solid fa-volume-xmark';
+                else if (volume < 0.5) vIcon.className = 'fa-solid fa-volume-low';
+                else vIcon.className = 'fa-solid fa-volume-high';
+            }
+
+            // Extract UI info from msg
+            const nameEl = msg.querySelector('.ch_name');
+            const avatarEl = msg.querySelector('.avatar img');
+            updateInfo({
+                name: nameEl ? nameEl.textContent.trim() : 'Unknown',
+                avatarUrl: avatarEl ? avatarEl.src : null,
+                text: '正在缓冲...'
+            });
+
+            container.classList.add('visible');
+        }
+
+        function hide() {
+            if (container) {
+                container.classList.remove('visible');
+                if (globalController) {
+                    globalController.pause();
+                }
+                globalController = null;
+            }
+        }
+
+        return { show, hide, updateProgress, updatePlayState, updateInfo };
+    })();
+
     async function inferMessageAudios(msg, triggerBtn, isSilent = false) {
         if (!msg) return;
         const mesId = getMessageId(msg);
@@ -1710,6 +2104,7 @@
             const lines = collectVNLinesFromMessage(msg);
             const list = [];
             const unvoicedCount = lines.filter(l => !l.voice).length;
+            let cachedCount = 0;
 
             if (!lines.length) {
                 if (!isSilent && window.toastr) window.toastr.warning('未在消息中发现符合格式的 [角色] 文本，请检查是否为 GAL 模式及剧本格式');
@@ -1727,6 +2122,7 @@
                             emotion: line.emotion,
                         });
                         if (!record) continue;
+                        if (record.isCached) cachedCount++;
                         const blobUrl = URL.createObjectURL(record.blob);
                         list.push({
                             text: line.text,
@@ -1743,22 +2139,17 @@
 
             audioCache[mesId] = list;
 
-            // 统计因网络失败而跳过的行数（有配音但未生成记录）
-            const voicedLines = lines.filter(l => l.voice);
-            const networkSkipped = voicedLines.length - list.length - 0; // 0 placeholder for other skip reasons
-
             if (list.length) {
                 const playBtn = msg.querySelector('.indextts-play');
                 if (playBtn) playBtn.classList.add('indextts-prepared');
                 if (window.toastr && !isSilent) {
-                    let detail = `已准备 ${list.length} 句音频`;
-                    if (unvoicedCount > 0) detail += `，${unvoicedCount} 句未配置配音已跳过`;
-                    if (networkSkipped > 0) detail += `，${networkSkipped} 句因服务离线无缓存已跳过`;
-                    window.toastr.success(detail);
+                    let msgStr = cachedCount === list.length ? `已从缓存装载 ${list.length} 句音频` : `已推理 ${list.length} 句音频`;
+                    if (unvoicedCount > 0 && unvoicedCount < lines.length) {
+                        window.toastr.success(`${msgStr}，${unvoicedCount} 句未配置配音已跳过`);
+                    } else {
+                        window.toastr.success(msgStr);
+                    }
                 }
-            } else if (voicedLines.length > 0 && !isSilent && window.toastr) {
-                // 全部有配音行都失败了（没有一句缓存命中）
-                window.toastr.warning('IndexTTS 服务未启动，仅能播放已预处理的音频');
             }
 
             return list;
@@ -1788,17 +2179,23 @@
         }
 
         (async () => {
-            const queue = audioCache[mesId] || [];
+            let queue = audioCache[mesId] || [];
             if (!queue.length) {
-                if (window.toastr) window.toastr.warning('无储备音频，请先点击推理！');
-                return;
+                await inferMessageAudios(msg, null, true);
+                queue = audioCache[mesId] || [];
+                if (!queue.length) {
+                    if (window.toastr) window.toastr.warning('无储备音频，请先点击推理！');
+                    return;
+                }
             }
 
             // 1. Pre-calculate durations for Global Scrubber
             if (window.toastr) window.toastr.info('正在准备播放列表...');
 
             // Cleanup previous playback
-            if (currentPlayback.audio) {
+            if (currentPlayback.stop) {
+                currentPlayback.stop();
+            } else if (currentPlayback.audio) {
                 try { currentPlayback.audio.pause(); } catch (e) { }
             }
             clearPlayingInMessage(currentPlayback.msg);
@@ -1837,10 +2234,17 @@
             let currentIndex = 0;
             let currentAudio = null;
 
+            // Create unique session ID
+            const currentQueueId = Date.now();
+            currentPlayback.sessionId = currentQueueId;
+
             const playTrack = (index, seekTime = 0) => {
+                // Session Check
+                if (currentPlayback.sessionId !== currentQueueId) return;
+
                 if (index >= playlist.length) {
                     // Reset or Stop
-                    currentPlayback = { audio: null, msg: null, mesId: null, index: -1, playlist: null, totalDuration: 0, controller: null };
+                    currentPlayback.stop();
                     clearPlayingInMessage(msg);
                     return;
                 }
@@ -1851,6 +2255,9 @@
                 // Cleanup prev
                 if (currentAudio) {
                     currentAudio.pause();
+                    currentAudio.onended = null;
+                    currentAudio.onerror = null;
+                    if (currentAudio._indexttsTimeUpdate) currentAudio.removeEventListener('timeupdate', currentAudio._indexttsTimeUpdate);
                     currentAudio.src = ''; // help GC
                 }
 
@@ -1881,8 +2288,32 @@
                 clearPlayingInMessage(msg);
                 setLinePlayingByEncoded(msg, encT, encC, true);
 
-                // Bind Mini Player (Global Mode)
+                // Update Floater UI Info
+                const avatarEl = msg.querySelector('.avatar img');
+                let displayChar = item.character || 'Unknown';
+                if (displayChar.toLowerCase() === 'narrator' && avatarEl) {
+                    // Try to extract root character if narrator
+                    const nameEl = msg.querySelector('.ch_name');
+                    if (nameEl) displayChar = nameEl.textContent.trim();
+                }
+
+                TTSPlayerWindow.updateInfo({
+                    name: displayChar,
+                    text: item.text,
+                    avatarUrl: avatarEl ? avatarEl.src : null
+                });
+
+                // Bind Mini Player & Floater (Global Mode)
                 attachMiniPlayerToAudio(audio, true);
+
+                // Hook floater UI updates into audio playback
+                audio.addEventListener('timeupdate', () => {
+                    const elapsed = item.startOffset + audio.currentTime;
+                    // Ensure the duration doesn't jump arbitrarily to 0 during segment shifts
+                    TTSPlayerWindow.updateProgress(elapsed, totalDuration);
+                });
+                audio.addEventListener('play', () => TTSPlayerWindow.updatePlayState(true));
+                audio.addEventListener('pause', () => TTSPlayerWindow.updatePlayState(false));
 
                 // Events
                 audio.onended = () => {
@@ -1936,6 +2367,9 @@
             };
 
             currentPlayback.controller = controller;
+
+            // Show Floating Player
+            TTSPlayerWindow.show(msg, controller);
 
             // Start
             playTrack(0);
@@ -2677,6 +3111,33 @@
                 }
             }
             injectInlineButtons(msg);
+
+            const playBtn = msg.querySelector('.indextts-play');
+            if (playBtn && !playBtn.classList.contains('indextts-prepared') && !playBtn.dataset.indexttsPollingCheck) {
+                playBtn.dataset.indexttsPollingCheck = 'true';
+                const mesId = getMessageId(msg);
+                if (mesId && audioCache[mesId] && audioCache[mesId].length > 0) {
+                    playBtn.classList.add('indextts-prepared');
+                } else {
+                    const lines = collectVNLinesFromMessage(msg);
+                    if (lines.length > 0) {
+                        const firstLine = lines[0];
+                        if (firstLine.voice) {
+                            (async () => {
+                                const settings = getSettings();
+                                const normVoice = ensureWavSuffix(firstLine.voice || settings.defaultVoice);
+                                const speed = parseFloat(settings.speed || 1.0) || 1.0;
+                                const volume = parseFloat(settings.volume || 1.0) || 1.0;
+                                const hash = await generateHash(firstLine.character || 'Unknown', normVoice, firstLine.text, speed, volume, firstLine.emotion);
+                                const cached = await AudioStorage.getAudio(hash);
+                                if (cached && cached.blob) {
+                                    playBtn.classList.add('indextts-prepared');
+                                }
+                            })();
+                        }
+                    }
+                }
+            }
         });
     }
 
